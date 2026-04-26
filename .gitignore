@@ -55,3 +55,4 @@ wheels/
 .DS_Store
 Thumbs.db
 config/config.json
+config/config.json
