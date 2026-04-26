@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""
+Bug Bounty Reconnaissance Pipeline - VERSIÓN CORREGIDA
+Automated workflow: subfinder → dnsx → httpx → gowitness → nuclei
+"""
+
+import json
+import subprocess
+import sys
+import os
+import argparse
+import logging
+from datetime import datetime
+from pathlib import Path
+import requests
+import sqlite3
+
+# Configuración de paths
+BASE_DIR = Path(__file__).parent.parent                                                                           
+CONFIG_FILE = BASE_DIR / "config" / "config.json"                                                                 
+OUTPUT_DIR = BASE_DIR / "output"
+JSON_DIR = OUTPUT_DIR / "json"
+HTML_DIR = OUTPUT_DIR / "html"
+SCREENSHOTS_DIR = OUTPUT_DIR / "screenshots"
+LOGS_DIR = OUTPUT_DIR / "logs"
+
+
+class ReconPipeline:
+    def __init__(self, target, config_path=None):
+        self.target = target
+        self.domain = target.replace("https://", "").replace("http://", "").strip("/")
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_dir = OUTPUT_DIR / f"{self.domain}_{self.timestamp}"
+        
+        # Cargar configuración
+        self.config = self.load_config(config_path or CONFIG_FILE)
+        
+        # Setup logging
+        self.setup_logging()
+        
+        # Crear directorios de sesión
+        self.create_session_dirs()
+        
+        # Archivos de salida
+        self.subfinder_file = self.session_dir / "subdomains.txt"
+        self.dnsx_file = self.session_dir / "resolved.txt"
+        self.httpx_file = self.session_dir / "alive.json"
+        self.domains_clean_file = self.session_dir / "domains_clean.txt"
+        self.urls_file = self.session_dir / "urls.txt"
+        self.nuclei_file = self.session_dir / "vulnerabilities.json"
+        self.report_file = HTML_DIR / f"report_{self.domain}_{self.timestamp}.html"
+        self.history_db = OUTPUT_DIR / "history.db"
+        
+        self.logger.info(f"[+] Directorio de sesión: {self.session_dir}")
+        self.logger.info(f"[+] Pipeline iniciado para: {self.domain}")
+
+    def load_config(self, config_path):
+        """Carga configuración desde JSON"""
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                # Asegurar valores por defecto
+                config.setdefault('dnsx', {})
+                config['dnsx'].setdefault('wildcard_filter', True)
+                config.setdefault('output', {})
+                config['output'].setdefault('notify_new_subdomains', True)
+                config.setdefault('skip_nuclei', False)
+                return config
+        except Exception as e:
+            print(f"[-] Error cargando config: {e}")
+            sys.exit(1)
+
+    def setup_logging(self):
+        """Configura logging a archivo y consola"""
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = LOGS_DIR / f"pipeline_{self.timestamp}.log"
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def create_session_dirs(self):
+        """Crea directorios necesarios para la sesión"""
+        dirs = [self.session_dir, JSON_DIR, HTML_DIR, SCREENSHOTS_DIR, LOGS_DIR]
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"[+] Directorio de sesión creado: {self.session_dir}")
+
+    def run_command(self, cmd, shell=True):
+        """Ejecuta comando y maneja errores"""
+        self.logger.info(f"[CMD] {cmd}")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=shell,
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            
+            if result.returncode != 0:
+                if result.stderr:
+                    self.logger.warning(f"[WARN] {result.stderr[:200]}")
+                return False
+            
+            return True
+            
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"[-] Timeout ejecutando: {cmd[:50]}...")
+            return False
+        except Exception as e:
+            self.logger.error(f"[-] Error ejecutando comando: {e}")
+            return False
+
+    def count_lines(self, filepath):
+        """Cuenta líneas en archivo"""
+        try:
+            with open(filepath, 'r') as f:
+                return sum(1 for _ in f)
+        except:
+            return 0
+
+    def run_subfinder(self):
+        """Etapa 1: Descubrimiento de subdominios con subfinder"""
+        self.logger.info("[*] Ejecutando Subfinder...")
+        
+        cmd = f"subfinder -d {self.domain} -o {self.subfinder_file} -all -silent"
+        
+        if self.run_command(cmd):
+            count = self.count_lines(self.subfinder_file)
+            if count > 0:
+                self.logger.info(f"[+] Subfinder completado: {count} subdominios encontrados")
+                return True
+            else:
+                self.logger.warning("[-] Subfinder no encontró subdominios")
+                return False
+        else:
+            self.logger.error("[-] Subfinder falló")
+            return False
+
+    def run_dnsx(self):
+        """Etapa 2: Resolución DNS con dnsx - VERSIÓN CORREGIDA"""
+        self.logger.info("[*] Ejecutando DNSx...")
+        
+        if not self.subfinder_file.exists():
+            self.logger.error("[-] No se encontró archivo de subfinder")
+            return False
+        
+        # Comando DNSx corregido - usando -a para A records
+        cmd = f"dnsx -l {self.subfinder_file} -a -resp -silent -o {self.dnsx_file}"
+        
+        if self.run_command(cmd):
+            if self.dnsx_file.exists():
+                count = self.count_lines(self.dnsx_file)
+                self.logger.info(f"[+] DNSx completado: {count} subdominios resueltos")
+                return True
+            else:
+                self.logger.error("[-] DNSx no generó archivo de salida")
+                return False
+        else:
+            self.logger.error("[-] DNSx falló")
+            return False
+
+    def extract_domains_from_dnsx(self):
+        """Extrae dominios limpios del output de dnsx"""
+        domains = []
+        try:
+            with open(self.dnsx_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        # El formato es: dominio [IP]
+                        domain = line.split()[0] if line.split() else None
+                        if domain:
+                            domains.append(domain)
+            
+            with open(self.domains_clean_file, 'w') as f:
+                f.write('\n'.join(domains))
+            
+            return len(domains)
+        except Exception as e:
+            self.logger.error(f"Error extrayendo dominios: {e}")
+            return 0
+
+    def run_httpx(self):
+        """Etapa 3: Probing HTTP/HTTPS con httpx"""
+        self.logger.info("[*] Ejecutando HTTPx...")
+        
+        if not self.dnsx_file.exists():
+            self.logger.error("[-] No se encontró archivo de dnsx")
+            return False
+        
+        # Extraer dominios limpios
+        total_domains = self.extract_domains_from_dnsx()
+        self.logger.info(f"[+] Procesando {total_domains} dominios con HTTPx...")
+        
+        if total_domains == 0:
+            self.logger.warning("[-] No hay dominios para procesar")
+            return False
+        
+        # Comando httpx
+        cmd = f"httpx -l {self.domains_clean_file} -json -silent -status-code -title -tech-detect -follow-redirects -timeout 10 -threads 100 > {self.httpx_file}"
+        
+        if self.run_command(cmd):
+            count = self.count_lines(self.httpx_file)
+            self.logger.info(f"[+] HTTPx completado: {count} hosts activos")
+            
+            # También generar archivo urls.txt
+            self.extract_urls_from_httpx()
+            return True
+        else:
+            self.logger.error("[-] HTTPx falló")
+            return False
+
+    def extract_urls_from_httpx(self):
+        """Extrae URLs del output JSON de httpx"""
+        urls = []
+        try:
+            with open(self.httpx_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        data = json.loads(line.strip())
+                        url = data.get('url', '')
+                        if url:
+                            urls.append(url)
+            
+            with open(self.urls_file, 'w') as f:
+                f.write('\n'.join(urls))
+            
+            self.logger.info(f"[+] Extraídas {len(urls)} URLs")
+            return len(urls)
+        except Exception as e:
+            self.logger.error(f"Error extrayendo URLs: {e}")
+            return 0
+
+    def run_gowitness(self):
+        """Etapa 4: Capturas de pantalla con gowitness"""
+        self.logger.info("[*] Ejecutando GoWitness...")
+        
+        if not self.urls_file.exists():
+            self.logger.error("[-] No se encontró archivo de URLs")
+            return False
+        
+        screenshot_session_dir = SCREENSHOTS_DIR / f"{self.domain}_{self.timestamp}"
+        screenshot_session_dir.mkdir(parents=True, exist_ok=True)
+        
+        cmd = f"gowitness scan -f {self.urls_file} -d {screenshot_session_dir} --threads 5 --timeout 10"
+        
+        if self.run_command(cmd):
+            self.logger.info(f"[+] GoWitness completado. Screenshots en: {screenshot_session_dir}")
+            return True
+        else:
+            self.logger.warning("[!] GoWitness falló (continuando...)")
+            return False
+
+    def run_nuclei(self):
+        """Etapa 5: Escaneo de vulnerabilidades con nuclei"""
+        self.logger.info("[*] Ejecutando Nuclei...")
+        
+        if not self.urls_file.exists():
+            self.logger.error("[-] No se encontró archivo de URLs")
+            return False
+        
+        cmd = f"nuclei -l {self.urls_file} -json -silent -severity critical,high,medium -rate-limit 150 -c 50 > {self.nuclei_file}"
+        
+        if self.run_command(cmd):
+            count = self.count_lines(self.nuclei_file)
+            self.logger.info(f"[+] Nuclei completado: {count} hallazgos")
+            return True
+        else:
+            self.logger.warning("[!] Nuclei falló (continuando...)")
+            return False
+
+    def send_telegram_notification(self, message):
+        """Envía notificación a Telegram"""
+        if not self.config['telegram'].get('enabled', False):
+            self.logger.info("[*] Telegram notifications disabled")
+            return
+        
+        bot_token = self.config['telegram'].get('bot_token', '')
+        chat_id = self.config['telegram'].get('chat_id', '')
+        
+        if not bot_token or not chat_id or bot_token == "TU_BOT_TOKEN_AQUI":
+            self.logger.warning("[!] Telegram no configurado correctamente")
+            return
+        
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code == 200:
+                self.logger.info("[+] Notificación Telegram enviada")
+            else:
+                self.logger.warning(f"[!] Error Telegram: {response.text}")
+        except Exception as e:
+            self.logger.error(f"[-] Error enviando a Telegram: {e}")
+
+    def check_new_subdomains(self):
+        """Compara con historial y detecta subdominios nuevos"""
+        if not self.subfinder_file.exists():
+            return set()
+        
+        # Crear tabla si no existe
+        conn = sqlite3.connect(self.history_db)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS subdomains (
+                domain TEXT,
+                subdomain TEXT,
+                first_seen TEXT,
+                last_seen TEXT,
+                UNIQUE(domain, subdomain)
+            )
+        """)
+        
+        # Leer subdominios actuales
+        with open(self.subfinder_file, 'r') as f:
+            current_subs = {line.strip() for line in f if line.strip()}
+        
+        # Consultar históricos
+        cursor.execute("SELECT subdomain FROM subdomains WHERE domain = ?", (self.domain,))
+        known_subs = {row[0] for row in cursor.fetchall()}
+        
+        # Detectar nuevos
+        new_subs = current_subs - known_subs
+        
+        if new_subs:
+            self.logger.info(f"[+] Nuevos subdominios detectados: {len(new_subs)}")
+            
+            # Guardar en BD
+            now = datetime.now().isoformat()
+            for sub in new_subs:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO subdomains (domain, subdomain, first_seen, last_seen) VALUES (?, ?, COALESCE((SELECT first_seen FROM subdomains WHERE domain=? AND subdomain=?), ?), ?)",
+                    (self.domain, sub, self.domain, sub, now, now)
+                )
+            
+            # Notificar
+            msg = f"🔔 *Nuevos subdominios en {self.domain}*\n\n"
+            for sub in list(new_subs)[:10]:
+                msg += f"• `{sub}`\n"
+            if len(new_subs) > 10:
+                msg += f"\n*... y {len(new_subs) - 10} más*"
+            
+            self.send_telegram_notification(msg)
+        
+        conn.commit()
+        conn.close()
+        return new_subs
+
+    def generate_html_report(self):
+        """Genera reporte HTML con los resultados"""
+        self.logger.info("[*] Generando reporte HTML...")
+        
+        # Leer subdominios
+        subdomains = []
+        if self.subfinder_file.exists():
+            with open(self.subfinder_file, 'r') as f:
+                subdomains = [line.strip() for line in f if line.strip()]
+        
+        # Leer hosts activos
+        alive_hosts = []
+        if self.httpx_file.exists():
+            with open(self.httpx_file, 'r') as f:
+                for line in f:
+                    try:
+                        if line.strip():
+                            alive_hosts.append(json.loads(line))
+                    except:
+                        pass
+        
+        # Leer vulnerabilidades
+        vulnerabilities = []
+        if self.nuclei_file.exists():
+            with open(self.nuclei_file, 'r') as f:
+                for line in f:
+                    try:
+                        if line.strip():
+                            vulnerabilities.append(json.loads(line))
+                    except:
+                        pass
+        
+        # Generar HTML
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Recon Report - {self.domain}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; border-bottom: 3px solid #007bff; padding-bottom: 10px; }}
+        h2 {{ color: #555; margin-top: 30px; }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
+        .stat-box {{ background: #007bff; color: white; padding: 20px; border-radius: 8px; text-align: center; }}
+        .stat-number {{ font-size: 2em; font-weight: bold; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background: #007bff; color: white; }}
+        tr:hover {{ background: #f5f5f5; }}
+        .severity-critical {{ color: #dc3545; font-weight: bold; }}
+        .severity-high {{ color: #fd7e14; font-weight: bold; }}
+        .severity-medium {{ color: #ffc107; }}
+        .severity-low {{ color: #28a745; }}
+        .timestamp {{ color: #666; font-size: 0.9em; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 Reconnaissance Report: {self.domain}</h1>
+        <p class="timestamp">Generado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-number">{len(subdomains)}</div>
+                <div>Subdominios</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number">{len(alive_hosts)}</div>
+                <div>Hosts Vivos</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-number">{len(vulnerabilities)}</div>
+                <div>Vulnerabilidades</div>
+            </div>
+        </div>
+        
+        <h2>📋 Subdominios Descubiertos</h2>
+        <table>
+            <tr><th>#</th><th>Subdominio</th></tr>
+            {''.join(f'<tr><td>{i+1}</td><td>{sub}</td></tr>' for i, sub in enumerate(subdomains[:50]))}
+        </table>
+        {f'<p>... y {len(subdomains) - 50} más</p>' if len(subdomains) > 50 else ''}
+        
+        <h2>🌐 Hosts Activos</h2>
+        <table>
+            <tr><th>URL</th><th>Status</th><th>Título</th></tr>
+            {''.join(f"<tr><td>{h.get('url', 'N/A')}</td><td>{h.get('status_code', 'N/A')}</td><td>{h.get('title', 'N/A')[:50]}</td></tr>" for h in alive_hosts[:30])}
+        </table>
+        
+        <h2>⚠️ Vulnerabilidades Detectadas</h2>
+        <table>
+            <tr><th>Severidad</th><th>Nombre</th><th>Host</th></tr>
+            {''.join(f"<tr><td class='severity-{v.get('info', {}).get('severity', 'unknown')}'>{v.get('info', {}).get('severity', 'N/A').upper()}</td><td>{v.get('info', {}).get('name', 'N/A')[:50]}</td><td>{v.get('host', 'N/A')}</td></tr>" for v in vulnerabilities[:20])}
+        </table>
+    </div>
+</body>
+</html>"""
+        
+        with open(self.report_file, 'w') as f:
+            f.write(html_content)
+        
+        self.logger.info(f"[+] Reporte HTML generado: {self.report_file}")
+        return self.report_file
+
+    def run(self):
+        """Ejecuta el pipeline completo"""
+        self.logger.info("=" * 60)
+        self.logger.info("INICIANDO RECONNAISSANCE PIPELINE")
+        self.logger.info(f"Target: {self.domain}")
+        self.logger.info("=" * 60)
+        
+        success = True
+        
+        # Paso 1: Subfinder
+        if not self.run_subfinder():
+            self.logger.error("❌ Subfinder falló - Pipeline abortado")
+            success = False
+        else:
+            # Paso 2: DNSx
+            if not self.run_dnsx():
+                self.logger.error("❌ DNSx falló - Pipeline abortado")
+                success = False
+            else:
+                # Paso 3: HTTPx
+                if not self.run_httpx():
+                    self.logger.error("❌ HTTPx falló - Pipeline abortado")
+                    success = False
+                else:
+                    # Detectar nuevos subdominios
+                    self.check_new_subdomains()
+                    
+                    # Paso 4: GoWitness (opcional)
+                    self.run_gowitness()
+                    
+                    # Paso 5: Nuclei (opcional)
+                    if not self.config.get('skip_nuclei', False):
+                        self.run_nuclei()
+                    
+                    # Generar reporte
+                    self.generate_html_report()
+                    
+                    # Notificación final
+                    self.send_telegram_notification(
+                        f"✅ *Recon completado para {self.domain}*\n"
+                        f"📊 Subdominios: {self.count_lines(self.subfinder_file)}\n"
+                        f"🌐 Hosts activos: {self.count_lines(self.httpx_file)}\n"
+                        f"📁 Output: `{self.session_dir}`"
+                    )
+        
+        self.logger.info("=" * 60)
+        self.logger.info("✅ PIPELINE COMPLETADO" if success else "❌ PIPELINE FALLÓ")
+        self.logger.info("=" * 60)
+        
+        return success
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Bug Bounty Recon Pipeline")
+    parser.add_argument("target", help="Dominio objetivo (ej: example.com)")
+    parser.add_argument("-c", "--config", help="Path a archivo de config", default=None)
+    parser.add_argument("--skip-nuclei", action="store_true", help="Saltar nuclei")
+    
+    args = parser.parse_args()
+    
+    pipeline = ReconPipeline(args.target, args.config)
+    if args.skip_nuclei:
+        pipeline.config['skip_nuclei'] = True
+    
+    success = pipeline.run()
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
